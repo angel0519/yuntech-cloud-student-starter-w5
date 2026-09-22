@@ -230,8 +230,15 @@ def down():
     run_aws(["ec2", "wait", "instance-terminated", "--instance-ids", resources["instance_id"]], ctx["region"])
     run_aws(["ec2", "delete-security-group", "--group-id", resources["security_group_id"]], ctx["region"])
     run_aws(["ec2", "delete-key-pair", "--key-name", resources["key_name"]], ctx["region"])
+    try:
+        instance = run_aws(["ec2", "describe-instances", "--instance-ids", resources["instance_id"]], ctx["region"])
+        state = instance["Reservations"][0]["Instances"][0]["State"]["Name"]
+        if state != "terminated":
+            raise LabError("Tracked instance is not terminated: " + state)
+    except LabError as exc:
+        if "describe-instances" not in str(exc):
+            raise
     for args in (
-        ["ec2", "describe-instances", "--instance-ids", resources["instance_id"]],
         ["ec2", "describe-volumes", "--volume-ids", resources["root_volume_id"]],
         *(["ec2", "describe-network-interfaces", "--network-interface-ids", eni]
           for eni in resources.get("eni_ids", [])),
