@@ -86,6 +86,21 @@ def package_user_data(commit):
     return output
 
 
+def validate_security_group(group, source_cidr):
+    actual = []
+    for permission in group.get("IpPermissions", []):
+        if permission.get("IpProtocol") != "tcp":
+            raise LabError("Security Group contains a non-TCP ingress rule.")
+        ranges = permission.get("IpRanges", [])
+        if (len(ranges) != 1 or ranges[0].get("CidrIp") != source_cidr
+                or permission.get("Ipv6Ranges") or permission.get("UserIdGroupPairs")
+                or permission.get("PrefixListIds")):
+            raise LabError("Security Group source must be the single approved IPv4 /32.")
+        actual.append((permission.get("FromPort"), permission.get("ToPort")))
+    if sorted(actual) != [(22, 22), (80, 80)]:
+        raise LabError("Security Group ingress must contain only TCP 22 and TCP 80.")
+
+
 def up():
     settings = config()
     ctx = verify()
@@ -125,6 +140,9 @@ def up():
                       {"IpProtocol": "tcp", "FromPort": port, "ToPort": port,
                        "IpRanges": [{"CidrIp": settings["source_cidr"]}]} for port in (22, 80)
                   ])], ctx["region"])
+    group = run_aws(["ec2", "describe-security-groups", "--group-ids", sg_id], ctx["region"])["SecurityGroups"][0]
+    validate_security_group(group, settings["source_cidr"])
+    print("Security Group verified: only TCP 22/80 from the approved /32")
     run_aws(["ec2", "import-key-pair", "--key-name", key_name,
              "--public-key-material", "fileb://" + str(public_key)], ctx["region"])
     document["resources"]["key_name"] = key_name
