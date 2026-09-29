@@ -36,7 +36,7 @@ document.querySelector('#load').addEventListener('click', async () => {
     message.textContent = `共 ${result.events.length} 筆`;
     for (const event of result.events) {
       const item = document.createElement('li');
-      item.textContent = `${event.event_id} | ${event.device_id} | ${event.observed_at} | ${event.type} | ${event.note || ''}`;
+            item.textContent = `${event.event_id} | ${event.device_id} | ${event.observed_at} | ${event.received_at} | ${event.type} | ${event.note || ''}`;
       list.append(item);
     }
   } catch (error) {

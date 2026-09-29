@@ -86,6 +86,7 @@ class EventApiContract(unittest.TestCase):
             self.assertEqual(response.status, 200)
             markup = response.read().decode()
         self.assertIn("textContent", markup)
+        self.assertIn("event.received_at", markup)
         self.assertNotIn("innerHTML", markup)
         self.assertNotIn("localStorage", markup)
 
@@ -115,7 +116,7 @@ class EventApiContract(unittest.TestCase):
             urllib.request.urlopen(request, timeout=3)
         self.assertEqual(caught.exception.code, 400)
 
-        malformed_type = dict(valid, event_id="team7-1234-bad-type", type=[])
+        malformed_type = dict(valid, event_id="group-demo-07-1234-bad-type", type=[])
         status, body = self.request("/events", "POST", malformed_type, REPORTER)
         self.assertEqual(status, 400)
         self.assertEqual(body["field"], "type")
