@@ -154,7 +154,7 @@ def deploy():
     known_hosts.chmod(0o600)
     ssh_command(key_path, known_hosts, host, "sudo bash -s", payload)
     install_secret = (
-        "sudo bash -c 'install -d -o root -g root -m 700 /etc/inspection; "
+        "sudo bash -c 'install -d -o root -g root -m 755 /etc/inspection; "
         "umask 077; cat > /etc/inspection/app.env; "
         "chown root:root /etc/inspection/app.env; chmod 600 /etc/inspection/app.env'"
     )
