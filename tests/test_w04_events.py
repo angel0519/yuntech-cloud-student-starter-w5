@@ -68,7 +68,7 @@ class EventApiContract(unittest.TestCase):
         bad_status, bad_body = self.request("/events", "POST", timezone_error, REPORTER)
         self.assertEqual(bad_status, 400)
         self.assertEqual(bad_body["field"], "observed_at")
-        self.assertEqual(self.request("/events", "POST", valid, REPORTER)[0], 409)
+        self.assertEqual(self.request("/events", "POST", valid, REPORTER)[0], 200)
         self.assertEqual(self.request("/events", token=REPORTER)[0], 403)
         list_status, result = self.request("/events", token=OPERATOR)
         self.assertEqual(list_status, 200)
@@ -116,7 +116,7 @@ class EventApiContract(unittest.TestCase):
             urllib.request.urlopen(request, timeout=3)
         self.assertEqual(caught.exception.code, 400)
 
-        malformed_type = dict(valid, event_id="group-demo-07-1234-bad-type", type=[])
+        malformed_type = dict(valid, event_id="group-demo-07-4-bad-type", type=[])
         status, body = self.request("/events", "POST", malformed_type, REPORTER)
         self.assertEqual(status, 400)
         self.assertEqual(body["field"], "type")

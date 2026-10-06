@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Inspection service with in-memory W4 events and role-based bearer auth."""
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
@@ -15,6 +16,7 @@ DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
 EVENT_TYPES = {"status", "anomaly", "test"}
 EVENT_FIELDS = {"event_id", "device_id", "observed_at", "type", "note"}
 MAX_BODY = 4096
+EVENT_COLUMNS = "event_id, device_id, observed_at, type, note, received_at"
 
 PAGE = """<!doctype html>
 <html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -46,15 +48,147 @@ document.querySelector('#load').addEventListener('click', async () => {
 </script></html>"""
 
 
-def make_server(version_file, port=8080, reporter_token=None, operator_token=None):
+def _parse_timestamp(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _same_event(existing, incoming):
+    fields_match = all(existing.get(field) == incoming.get(field) for field in EVENT_FIELDS if field != "observed_at")
+    try:
+        times_match = _parse_timestamp(existing["observed_at"]) == _parse_timestamp(incoming["observed_at"])
+    except (KeyError, TypeError, ValueError):
+        times_match = existing.get("observed_at") == incoming.get("observed_at")
+    return fields_match and times_match
+
+
+def _utc_text(value):
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+class MemoryStore:
+    def __init__(self):
+        self.events = []
+        self.lock = threading.Lock()
+
+    def create(self, event):
+        with self.lock:
+            existing = next((item for item in self.events if item["event_id"] == event["event_id"]), None)
+            if existing is not None:
+                return (200, dict(existing)) if _same_event(existing, event) else (409, None)
+            stored = dict(event)
+            stored["received_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            self.events.append(stored)
+            return 201, dict(stored)
+
+    def latest(self):
+        with self.lock:
+            return [dict(item) for item in reversed(self.events[-50:])]
+
+    def get(self, event_id):
+        with self.lock:
+            item = next((item for item in self.events if item["event_id"] == event_id), None)
+            return dict(item) if item is not None else None
+
+
+class PostgresStore:
+    def __init__(self, config):
+        self.config = config
+
+    def connect(self):
+        import psycopg2
+
+        return psycopg2.connect(
+            host=self.config["DB_HOST"],
+            port=int(self.config.get("DB_PORT", "5432")),
+            dbname=self.config["DB_NAME"],
+            user=self.config["DB_USER"],
+            password=self.config["DB_PASSWORD"],
+            sslmode="verify-full",
+            sslrootcert="/etc/inspection/rds-ca.pem",
+            connect_timeout=5,
+        )
+
+    @contextmanager
+    def db_session(self):
+        connection = self.connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def ensure_table(self, cursor):
+        cursor.execute("""CREATE TABLE IF NOT EXISTS events (
+            event_id VARCHAR(64) PRIMARY KEY,
+            device_id VARCHAR(32) NOT NULL,
+            observed_at TIMESTAMPTZ NOT NULL,
+            type VARCHAR(16) NOT NULL,
+            note TEXT,
+            received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+    @staticmethod
+    def event_from_row(row):
+        event_id, device_id, observed_at, event_type, note, received_at = row
+        return {
+            "event_id": event_id,
+            "device_id": device_id,
+            "observed_at": _utc_text(observed_at),
+            "type": event_type,
+            "note": note,
+            "received_at": _utc_text(received_at),
+        }
+
+    def create(self, event):
+        with self.db_session() as connection:
+            with connection.cursor() as cursor:
+                self.ensure_table(cursor)
+                cursor.execute(
+                    """INSERT INTO events (event_id, device_id, observed_at, type, note)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (event_id) DO NOTHING
+                    RETURNING """ + EVENT_COLUMNS,
+                    (event["event_id"], event["device_id"], event["observed_at"], event["type"], event.get("note")),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    return 201, self.event_from_row(row)
+                cursor.execute("SELECT " + EVENT_COLUMNS + " FROM events WHERE event_id = %s", (event["event_id"],))
+                existing = self.event_from_row(cursor.fetchone())
+                return (200, existing) if _same_event(existing, event) else (409, None)
+
+    def latest(self):
+        with self.db_session() as connection:
+            with connection.cursor() as cursor:
+                self.ensure_table(cursor)
+                cursor.execute("SELECT " + EVENT_COLUMNS + " FROM events ORDER BY received_at DESC LIMIT %s", (50,))
+                return [self.event_from_row(row) for row in cursor.fetchall()]
+
+    def get(self, event_id):
+        with self.db_session() as connection:
+            with connection.cursor() as cursor:
+                self.ensure_table(cursor)
+                cursor.execute("SELECT " + EVENT_COLUMNS + " FROM events WHERE event_id = %s", (event_id,))
+                row = cursor.fetchone()
+                return self.event_from_row(row) if row is not None else None
+
+
+def _db_config_from_env():
+    keys = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
+    values = {key: os.environ.get(key, "") for key in keys}
+    return values if all(values.values()) else None
+
+
+def make_server(version_file, port=8080, reporter_token=None, operator_token=None, db_config=None, event_store=None):
     version = Path(version_file).read_text(encoding="utf-8").strip()
     if not re.fullmatch(r"[0-9a-f]{40}", version):
         raise ValueError("version must contain the deployed 40-character Git commit SHA")
     reporter_token = os.environ.get("REPORTER_TOKEN", "") if reporter_token is None else reporter_token
     operator_token = os.environ.get("OPERATOR_TOKEN", "") if operator_token is None else operator_token
+    db_config = _db_config_from_env() if db_config is None else db_config
+    store = event_store or (PostgresStore(db_config) if db_config else MemoryStore())
+    db_configured = db_config is not None or event_store is not None
     started = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-    events = []
-    events_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
@@ -96,7 +230,8 @@ def make_server(version_file, port=8080, reporter_token=None, operator_token=Non
             if path == "/health":
                 self.respond(200, {"status": "ok", "service": "inspection", "version": version,
                                    "started_at": started,
-                                   "auth_configured": bool(reporter_token and operator_token)})
+                                   "auth_configured": bool(reporter_token and operator_token),
+                                   "db_configured": db_configured})
                 return
             if path == "/":
                 self.respond(200, PAGE, "text/html; charset=utf-8")
@@ -104,9 +239,10 @@ def make_server(version_file, port=8080, reporter_token=None, operator_token=Non
             if path == "/events":
                 if not self.role("operator"):
                     return
-                with events_lock:
-                    latest = list(reversed(events[-50:]))
-                self.respond(200, {"events": latest})
+                try:
+                    self.respond(200, {"events": store.latest()})
+                except Exception:
+                    self.error(503, "database_unavailable", "database")
                 return
             if path.startswith("/events/"):
                 if not self.role("operator"):
@@ -115,8 +251,11 @@ def make_server(version_file, port=8080, reporter_token=None, operator_token=Non
                 if not EVENT_ID.fullmatch(event_id):
                     self.error(404, "not_found", "event_id")
                     return
-                with events_lock:
-                    found = next((event for event in events if event["event_id"] == event_id), None)
+                try:
+                    found = store.get(event_id)
+                except Exception:
+                    self.error(503, "database_unavailable", "database")
+                    return
                 if found is None:
                     self.error(404, "not_found", "event_id")
                 else:
@@ -182,14 +321,15 @@ def make_server(version_file, port=8080, reporter_token=None, operator_token=Non
             if "note" in event and (not isinstance(event["note"], str) or len(event["note"]) > 200):
                 self.error(400, "invalid_value", "note")
                 return
-            with events_lock:
-                if any(item["event_id"] == event["event_id"] for item in events):
-                    self.error(409, "duplicate", "event_id")
-                    return
-                stored = dict(event)
-                stored["received_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-                events.append(stored)
-            self.respond(201, stored)
+            try:
+                status, stored = store.create(event)
+            except Exception:
+                self.error(503, "database_unavailable", "database")
+                return
+            if status == 409:
+                self.error(409, "duplicate", "event_id")
+                return
+            self.respond(status, stored)
 
         def log_message(self, fmt, *args):
             pass

@@ -15,6 +15,7 @@ LOCAL = ROOT / ".local"
 CONFIG = LOCAL / "config.json"
 RESOURCES = LOCAL / "resources.json"
 APP_ENV = LOCAL / "app.env"
+DB_ENV = LOCAL / "db.env"
 sys.path.insert(0, str(ROOT))
 from scripts.lab import LabError, approve, run_aws, verify  # noqa: E402
 
@@ -54,7 +55,23 @@ def read_secret_file():
         values[key] = value
     if set(values) != {"REPORTER_TOKEN", "OPERATOR_TOKEN"} or values["REPORTER_TOKEN"] == values["OPERATOR_TOKEN"]:
         raise LabError(".local/app.env must contain distinct reporter and operator tokens.")
-    return APP_ENV.read_bytes()
+    payload = APP_ENV.read_bytes().rstrip() + b"\n"
+    if DB_ENV.exists():
+        if DB_ENV.stat().st_mode & 0o777 != 0o600:
+            raise LabError(".local/db.env permissions must be exactly 600.")
+        db_contents = DB_ENV.read_text(encoding="utf-8")
+        db_values = {}
+        for line in db_contents.splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or key not in {"DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"}:
+                raise LabError(".local/db.env contains an unexpected setting.")
+            if key in db_values or not value:
+                raise LabError(".local/db.env contains a duplicate or empty setting.")
+            db_values[key] = value
+        if set(db_values) != {"DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"}:
+            raise LabError(".local/db.env must contain all five DB settings before W5 deployment.")
+        payload += DB_ENV.read_bytes().rstrip() + b"\n"
+    return payload
 
 
 def verify_ingress(group, source):
@@ -129,7 +146,7 @@ def deploy():
     print("將要部署：")
     print(f"- instance {instance_id} at {host}")
     print(f"- committed service version {commit}")
-    print("- install service, upload root-owned mode-600 /etc/inspection/app.env, restart inspection")
+    print("- install service and upload root-owned mode-600 /etc/inspection/app.env, then restart inspection")
     approve("", "CONFIRM")
     LOCAL.mkdir(mode=0o700, exist_ok=True)
     known_hosts = LOCAL / "w04_known_hosts"
@@ -149,7 +166,9 @@ def deploy():
         try:
             with urllib.request.urlopen(url, timeout=8) as response:
                 health = json.loads(response.read().decode())
-            if response.status == 200 and health.get("version") == commit and health.get("auth_configured") is True:
+            database_ready = not DB_ENV.exists() or health.get("db_configured") is True
+            if (response.status == 200 and health.get("version") == commit
+                    and health.get("auth_configured") is True and database_ready):
                 print(json.dumps(health, indent=2))
                 return
         except (OSError, urllib.error.HTTPError, UnicodeDecodeError, json.JSONDecodeError):
