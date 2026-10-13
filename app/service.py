@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import re
 import threading
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 EVENT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
@@ -22,9 +22,11 @@ PAGE = """<!doctype html>
 <html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>巡檢事件</title>
 <main><h1>巡檢事件</h1><label>Operator 權杖 <input id="token" type="password" autocomplete="off"></label>
+<label>設備編號 <input id="device" autocomplete="off"></label>
 <button id="load" type="button">載入事件</button><p id="message" role="status"></p><ul id="events"></ul></main>
 <script>
 const tokenInput = document.querySelector('#token');
+const deviceInput = document.querySelector('#device');
 const message = document.querySelector('#message');
 const list = document.querySelector('#events');
 document.querySelector('#load').addEventListener('click', async () => {
@@ -32,7 +34,9 @@ document.querySelector('#load').addEventListener('click', async () => {
   tokenInput.value = '';
   list.replaceChildren();
   try {
-    const response = await fetch('/events', {headers: {Authorization: `Bearer ${token}`}});
+    const device = deviceInput.value.trim();
+    const url = device ? `/events?device_id=${encodeURIComponent(device)}` : '/events';
+    const response = await fetch(url, {headers: {Authorization: `Bearer ${token}`}});
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'request_failed');
     message.textContent = `共 ${result.events.length} 筆`;
@@ -80,9 +84,10 @@ class MemoryStore:
             self.events.append(stored)
             return 201, dict(stored)
 
-    def latest(self):
+    def latest(self, device_id=None):
         with self.lock:
-            return [dict(item) for item in reversed(self.events[-50:])]
+            items = [item for item in self.events if device_id in (None, item["device_id"])]
+            return [dict(item) for item in reversed(items[-50:])]
 
     def get(self, event_id):
         with self.lock:
@@ -157,11 +162,14 @@ class PostgresStore:
                 existing = self.event_from_row(cursor.fetchone())
                 return (200, existing) if _same_event(existing, event) else (409, None)
 
-    def latest(self):
+    def latest(self, device_id=None):
         with self.db_session() as connection:
             with connection.cursor() as cursor:
                 self.ensure_table(cursor)
-                cursor.execute("SELECT " + EVENT_COLUMNS + " FROM events ORDER BY received_at DESC LIMIT %s", (50,))
+                if device_id is None:
+                    cursor.execute("SELECT " + EVENT_COLUMNS + " FROM events ORDER BY received_at DESC LIMIT %s", (50,))
+                else:
+                    cursor.execute("SELECT " + EVENT_COLUMNS + " FROM events WHERE device_id = %s ORDER BY received_at DESC LIMIT %s", (device_id, 50))
                 return [self.event_from_row(row) for row in cursor.fetchall()]
 
     def get(self, event_id):
@@ -239,8 +247,12 @@ def make_server(version_file, port=8080, reporter_token=None, operator_token=Non
             if path == "/events":
                 if not self.role("operator"):
                     return
+                device_id = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get("device_id", [None])[0]
+                if device_id is not None and not DEVICE_ID.fullmatch(device_id):
+                    self.error(400, "invalid_value", "device_id")
+                    return
                 try:
-                    self.respond(200, {"events": store.latest()})
+                    self.respond(200, {"events": store.latest(device_id)})
                 except Exception:
                     self.error(503, "database_unavailable", "database")
                 return

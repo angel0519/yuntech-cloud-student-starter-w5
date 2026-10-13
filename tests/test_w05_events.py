@@ -62,12 +62,18 @@ class SQLiteStore:
                 return 201, existing
             return (200, existing) if service._same_event(existing, event) else (409, None)
 
-    def latest(self):
+    def latest(self, device_id=None):
         with self.connect() as connection:
-            rows = connection.execute(
-                "SELECT event_id, device_id, observed_at, type, note, received_at FROM events ORDER BY received_at DESC LIMIT ?",
-                (50,),
-            ).fetchall()
+            if device_id is None:
+                rows = connection.execute(
+                    "SELECT event_id, device_id, observed_at, type, note, received_at FROM events ORDER BY received_at DESC LIMIT ?",
+                    (50,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT event_id, device_id, observed_at, type, note, received_at FROM events WHERE device_id = ? ORDER BY received_at DESC LIMIT ?",
+                    (device_id, 50),
+                ).fetchall()
         return [self.event_from_row(row) for row in rows]
 
     def get(self, event_id):

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Deploy one committed W4 service version to the tracked W3 EC2 host."""
+import io
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -16,6 +18,11 @@ CONFIG = LOCAL / "config.json"
 RESOURCES = LOCAL / "resources.json"
 APP_ENV = LOCAL / "app.env"
 DB_ENV = LOCAL / "db.env"
+IOT = LOCAL / "iot"
+IOT_FILES = ("AmazonRootCA1.pem", "consumer.cert.pem", "consumer.private.key")
+IOT_INSTALL = ("sudo sh -c 'umask 077; install -d -o inspection -g inspection -m 700 /etc/inspection/iot "
+               "&& tar -x -C /etc/inspection/iot && chown inspection:inspection /etc/inspection/iot/* "
+               "&& chmod 600 /etc/inspection/iot/*'")
 sys.path.insert(0, str(ROOT))
 from scripts.lab import LabError, approve, run_aws, verify  # noqa: E402
 
@@ -74,6 +81,27 @@ def read_secret_file():
     return payload
 
 
+def iot_settings():
+    if not (IOT / "code").exists():
+        return None, None
+    code = (IOT / "code").read_text(encoding="utf-8").strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,40}", code):
+        raise LabError(".local/iot/code is invalid.")
+    for name in ("endpoint", *IOT_FILES):
+        if not (IOT / name).is_file():
+            raise LabError(f"Missing .local/iot/{name}; finish W6 step 2 first.")
+    endpoint = (IOT / "endpoint").read_text(encoding="utf-8").strip()
+    devices = ",".join(f"{code}-d{number:02d}" for number in range(1, 11))
+    env = (f"IOT_ENDPOINT={endpoint}\nIOT_TOPIC=cxe/{code}/gw/events\nIOT_CLIENT_ID=consumer-{code}\n"
+           f"IOT_DEVICE_IDS={devices}\nIOT_CA=/etc/inspection/iot/AmazonRootCA1.pem\n"
+           "IOT_CERT=/etc/inspection/iot/consumer.cert.pem\nIOT_KEY=/etc/inspection/iot/consumer.private.key\n")
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        for name in IOT_FILES:
+            tar.add(IOT / name, arcname=name)
+    return env.encode(), buffer.getvalue()
+
+
 def verify_ingress(group, source):
     observed = []
     for permission in group.get("IpPermissions", []):
@@ -108,6 +136,9 @@ def deploy():
     if not sys.stdin.isatty():
         raise LabError("Deployment requires an interactive terminal for explicit approval.")
     secret_payload = read_secret_file()
+    iot_env, iot_archive = iot_settings()
+    if iot_env:
+        secret_payload += iot_env
     settings = load_json(CONFIG)
     record = load_json(RESOURCES)
     resources = record.get("resources", {})
@@ -119,7 +150,7 @@ def deploy():
     if key_path.stat().st_mode & 0o777 != 0o600:
         raise LabError("SSH private key permissions must be 600.")
     commit = subprocess.check_output(["git", "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"], cwd=ROOT, text=True).strip()
-    if subprocess.check_output(["git", "status", "--porcelain", "--", "app/service.py", "deploy/nginx.conf"], cwd=ROOT, text=True).strip():
+    if subprocess.check_output(["git", "status", "--porcelain", "--", "app/service.py", "app/consumer.py", "deploy/nginx.conf"], cwd=ROOT, text=True).strip():
         raise LabError("Commit app/service.py and deploy/nginx.conf before deployment.")
     ctx = verify()
     region = ctx["region"]
@@ -159,7 +190,12 @@ def deploy():
         "chown root:root /etc/inspection/app.env; chmod 600 /etc/inspection/app.env'"
     )
     ssh_command(key_path, known_hosts, host, install_secret, secret_payload)
+    if iot_archive:
+        ssh_command(key_path, known_hosts, host, IOT_INSTALL, iot_archive)
     ssh_command(key_path, known_hosts, host, "sudo systemctl restart inspection")
+    if iot_archive:
+        ssh_command(key_path, known_hosts, host,
+                    "sudo systemctl restart inspection-consumer && systemctl is-active inspection-consumer")
     deadline = time.monotonic() + 180
     url = f"http://{host}/health"
     while time.monotonic() < deadline:
